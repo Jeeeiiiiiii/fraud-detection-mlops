@@ -1,0 +1,55 @@
+# ---------------------------------------------------------------------------
+# Dev/local overrides for kind cluster testing
+# ---------------------------------------------------------------------------
+# Usage:
+#   helm install fraud-detection deployment/helm/fraud-detection \
+#     -f deployment/helm/fraud-detection/values.yaml \
+#     -f deployment/helm/fraud-detection/values-dev.yaml
+# ---------------------------------------------------------------------------
+
+global:
+  imageRegistry: ""
+  imagePullPolicy: Never
+  namespace: ml-fraud
+
+enrichment:
+  replicaCount: 1
+  image:
+    repository: fraud-enrichment
+    tag: latest
+  autoscaling:
+    enabled: false
+  podDisruptionBudget:
+    minAvailable: 0
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "250m"
+      memory: "512Mi"
+
+scoring:
+  replicaCount: 1
+  image:
+    repository: fraud-scoring
+    tag: latest
+  mlflow:
+    trackingUri: "http://localhost:5000"
+  autoscaling:
+    enabled: false
+  affinity: {}
+  topologySpreadConstraints: []
+  podDisruptionBudget:
+    minAvailable: 0
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "250m"
+      memory: "512Mi"
+
+serviceAccount:
+  create: false
+  name: default

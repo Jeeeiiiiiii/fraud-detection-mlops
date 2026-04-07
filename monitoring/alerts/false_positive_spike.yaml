@@ -1,0 +1,120 @@
+# ---------------------------------------------------------------------------
+# PrometheusRule: False Positive and Customer Complaint Alerts
+# ---------------------------------------------------------------------------
+# Monitors false positive rates and customer complaint volume to detect
+# model issues that harm legitimate customers.
+#
+# False positive feedback comes from:
+#   - Chargeback reversals (transaction was blocked but later confirmed legit)
+#   - Customer support ticket resolution
+#   - Automated dispute resolution pipeline
+#
+# Alert levels:
+#   - warning: FP rate > 10% for 1 hour
+#   - critical: Customer complaint rate spikes >100% vs 7-day average
+# ---------------------------------------------------------------------------
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fraud-false-positive-alerts
+  namespace: fraud-production
+  labels:
+    app.kubernetes.io/name: fraud-detection
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: fraud-detection-mlops
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: fraud-detection.false-positives
+      interval: 60s
+      rules:
+        # ---------------------------------------------------------------
+        # WARNING: False positive rate exceeds 10% for 1 hour
+        #
+        # A false positive rate above 10% means more than 1 in 10 blocked
+        # transactions are legitimate. This directly impacts customer
+        # experience and revenue.
+        #
+        # The FP rate is calculated from chargeback/dispute feedback data.
+        # Note: this metric has inherent lag (disputes take hours to days
+        # to resolve), so the alert uses a 1-hour sustained threshold.
+        # ---------------------------------------------------------------
+        - alert: FalsePositiveRateHigh
+          expr: |
+            sum(rate(fraud_false_positives_total[1h]))
+            / (
+              sum(rate(fraud_false_positives_total[1h]))
+              + sum(rate(fraud_true_positives_total[1h]))
+            )
+            > 0.10
+          for: 1h
+          labels:
+            severity: warning
+            team: fraud-detection
+            service: scoring
+            impact: customer-facing
+          annotations:
+            summary: "False positive rate exceeds 10% for 1 hour"
+            description: |
+              The fraud detection false positive rate has exceeded 10% for
+              the last hour, meaning more than 1 in 10 blocked transactions
+              are legitimate.
+
+              Current FP rate: {{ $value | printf "%.2f" }}
+
+              Customer impact:
+                - Legitimate transactions are being blocked.
+                - Customer support ticket volume likely increasing.
+                - Revenue loss from declined transactions.
+
+              Actions:
+                1. Check the false positive rate dashboard for breakdown by
+                   amount range and geography.
+                2. Determine if a recent model deployment caused the regression.
+                3. Review decision thresholds -- the BLOCK_THRESHOLD may need
+                   to be raised temporarily.
+                4. If model-related, initiate rollback to the previous version.
+            runbook_url: "https://wiki.example.com/runbooks/fraud-detection/false-positive-investigation"
+            dashboard_url: "https://grafana.example.com/d/fraud-fp-rate/false-positive-rate"
+
+        # ---------------------------------------------------------------
+        # CRITICAL: Customer complaint rate spikes >100% vs 7-day average
+        #
+        # Customer complaints about blocked transactions are a lagging
+        # indicator but a high-severity signal. A 2x spike indicates a
+        # systemic issue that is actively damaging customer trust.
+        # ---------------------------------------------------------------
+        - alert: CustomerComplaintsSpike
+          expr: |
+            sum(rate(customer_complaints_total{reason="blocked_transaction"}[1h]))
+            /
+            sum(rate(customer_complaints_total{reason="blocked_transaction"}[7d]))
+            > 2.0
+          for: 30m
+          labels:
+            severity: critical
+            team: fraud-detection
+            service: scoring
+            impact: customer-facing
+          annotations:
+            summary: "Customer complaint rate has doubled vs 7-day average"
+            description: |
+              Customer complaints about blocked transactions have increased
+              more than 100% compared to the 7-day average and have been
+              sustained for at least 30 minutes.
+
+              Current complaint rate ratio: {{ $value | printf "%.1f" }}x baseline
+
+              This is a critical customer experience issue. Immediate action:
+                1. Check the false positive rate dashboard for root cause.
+                2. Determine which customer segments are affected.
+                3. If a recent model deployment is responsible, initiate
+                   immediate rollback.
+                4. Consider temporarily raising the BLOCK_THRESHOLD to reduce
+                   false positives while the issue is investigated.
+                5. Notify the customer success team to prepare for
+                   increased support volume.
+            runbook_url: "https://wiki.example.com/runbooks/fraud-detection/incident-high-block-rate"
+            dashboard_url: "https://grafana.example.com/d/fraud-fp-rate/false-positive-rate"

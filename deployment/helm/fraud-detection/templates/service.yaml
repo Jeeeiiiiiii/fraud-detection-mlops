@@ -1,0 +1,51 @@
+# ---------------------------------------------------------------------------
+# Service: Enrichment
+# ---------------------------------------------------------------------------
+{{- if .Values.enrichment.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fraud-detection.fullname" . }}-enrichment
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "fraud-detection.enrichment.labels" . | nindent 4 }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8081"
+    prometheus.io/path: "/metrics"
+spec:
+  type: {{ .Values.enrichment.service.type }}
+  ports:
+    - port: {{ .Values.enrichment.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "fraud-detection.enrichment.selectorLabels" . | nindent 4 }}
+{{- end }}
+---
+# ---------------------------------------------------------------------------
+# Service: Scoring
+# ---------------------------------------------------------------------------
+{{- if .Values.scoring.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fraud-detection.fullname" . }}-scoring
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "fraud-detection.scoring.labels" . | nindent 4 }}
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  type: {{ .Values.scoring.service.type }}
+  ports:
+    - port: {{ .Values.scoring.service.port }}
+      targetPort: http
+      protocol: TCP
+      name: http
+  selector:
+    {{- include "fraud-detection.scoring.selectorLabels" . | nindent 4 }}
+{{- end }}

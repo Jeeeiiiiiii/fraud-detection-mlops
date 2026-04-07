@@ -1,0 +1,125 @@
+# ---------------------------------------------------------------------------
+# KServe InferenceService for Fraud Detection Scoring
+# ---------------------------------------------------------------------------
+# Deploys the fraud scoring model with strict latency requirements:
+#   - Target p99 latency: < 50 ms
+#   - Autoscaling based on request concurrency
+#   - Canary traffic splitting for safe rollouts
+# ---------------------------------------------------------------------------
+
+apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata:
+  name: fraud-detection-scoring
+  namespace: fraud-production
+  labels:
+    app.kubernetes.io/name: fraud-detection
+    app.kubernetes.io/component: scoring
+    app.kubernetes.io/part-of: fraud-detection-mlops
+  annotations:
+    # Autoscaler configuration for low-latency serving
+    autoscaling.knative.dev/class: kpa.autoscaling.knative.dev
+    autoscaling.knative.dev/metric: concurrency
+    autoscaling.knative.dev/target: "10"
+    autoscaling.knative.dev/minScale: "2"
+    autoscaling.knative.dev/maxScale: "20"
+    # Scale-down delay to absorb traffic bursts
+    autoscaling.knative.dev/scaleDownDelay: "60s"
+    # Prometheus scraping
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  predictor:
+    # Minimum replicas always running for latency SLA
+    minReplicas: 2
+    maxReplicas: 20
+
+    # Request timeout -- fail fast if scoring takes too long
+    timeout: 5
+
+    containers:
+      - name: fraud-scorer
+        image: gcr.io/fraud-detection-mlops/scoring:latest
+        ports:
+          - containerPort: 8080
+            protocol: TCP
+        env:
+          - name: MLFLOW_TRACKING_URI
+            value: "http://mlflow.ml-infra.svc.cluster.local:5000"
+          - name: MODEL_NAME
+            value: "fraud-detection-xgb"
+          - name: MODEL_VERSION
+            valueFrom:
+              configMapKeyRef:
+                name: fraud-detection-config
+                key: model-version
+          - name: REVIEW_THRESHOLD
+            valueFrom:
+              configMapKeyRef:
+                name: fraud-detection-config
+                key: review-threshold
+          - name: BLOCK_THRESHOLD
+            valueFrom:
+              configMapKeyRef:
+                name: fraud-detection-config
+                key: block-threshold
+          - name: LOG_LEVEL
+            value: "INFO"
+        resources:
+          requests:
+            cpu: "1"
+            memory: "2Gi"
+          limits:
+            cpu: "2"
+            memory: "4Gi"
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 15
+          timeoutSeconds: 3
+          failureThreshold: 5
+
+    # Pod affinity: spread across availability zones
+    affinity:
+      podAntiAffinity:
+        preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              labelSelector:
+                matchExpressions:
+                  - key: app.kubernetes.io/name
+                    operator: In
+                    values:
+                      - fraud-detection
+              topologyKey: topology.kubernetes.io/zone
+
+    # Topology spread for even distribution
+    topologySpreadConstraints:
+      - maxSkew: 1
+        topologyKey: topology.kubernetes.io/zone
+        whenUnsatisfiable: ScheduleAnyway
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: fraud-detection
+
+  # Canary traffic configuration for safe rollouts
+  # Uncomment to enable gradual rollout of a new model version:
+  # transformer:
+  #   containers:
+  #     - name: enrichment-proxy
+  #       image: gcr.io/fraud-detection-mlops/enrichment:latest
+  #       resources:
+  #         requests:
+  #           cpu: "500m"
+  #           memory: "1Gi"

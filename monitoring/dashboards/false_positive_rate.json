@@ -1,0 +1,406 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": "${DS_PROMETHEUS}",
+        "enable": true,
+        "expr": "ALERTS{alertname=~\"FalsePositive.*\", alertstate=\"firing\"}",
+        "iconColor": "orange",
+        "name": "FP Alerts",
+        "titleFormat": "{{alertname}}"
+      },
+      {
+        "datasource": "${DS_PROMETHEUS}",
+        "enable": true,
+        "expr": "ALERTS{alertname=\"CustomerComplaintsSpike\", alertstate=\"firing\"}",
+        "iconColor": "red",
+        "name": "Complaint Alerts",
+        "titleFormat": "Customer Complaints Spike"
+      }
+    ]
+  },
+  "description": "False positive monitoring: rates over time, customer impact, breakdown by amount range and geography",
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "icon": "external link",
+      "title": "Fraud Rate Dashboard",
+      "type": "link",
+      "url": "/d/fraud-rate-overview/fraud-rate"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Current False Positive Rate",
+      "description": "Percentage of blocked transactions that were actually legitimate (based on chargeback/dispute feedback)",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(fraud_false_positives_total[1h])) / (sum(rate(fraud_false_positives_total[1h])) + sum(rate(fraud_true_positives_total[1h]))) * 100",
+          "legendFormat": "FP Rate %",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 5, "color": "yellow" },
+              { "value": 10, "color": "orange" },
+              { "value": 20, "color": "red" }
+            ]
+          },
+          "decimals": 2
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Blocked Legitimate Transactions (Last 24h)",
+      "description": "Count of legitimate transactions that were incorrectly blocked",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(increase(fraud_false_positives_total[24h]))",
+          "legendFormat": "FP Count",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 100, "color": "yellow" },
+              { "value": 500, "color": "orange" },
+              { "value": 1000, "color": "red" }
+            ]
+          },
+          "decimals": 0
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Customer Complaint Rate",
+      "description": "Rate of customer complaints about blocked transactions",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(customer_complaints_total{reason=\"blocked_transaction\"}[1h])) * 3600",
+          "legendFormat": "Complaints/hr",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 10, "color": "yellow" },
+              { "value": 50, "color": "red" }
+            ]
+          },
+          "decimals": 1
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Estimated Revenue Impact (Blocked Legitimate, Last 24h)",
+      "description": "Estimated dollar value of legitimate transactions incorrectly blocked",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(increase(fraud_false_positive_amount_total[24h]))",
+          "legendFormat": "Revenue Impact",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 10000, "color": "yellow" },
+              { "value": 50000, "color": "orange" },
+              { "value": 100000, "color": "red" }
+            ]
+          },
+          "decimals": 0
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "id": 5,
+      "title": "False Positive Rate Over Time",
+      "description": "Trend of false positive rate with 7-day moving average baseline",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(fraud_false_positives_total[1h])) / (sum(rate(fraud_false_positives_total[1h])) + sum(rate(fraud_true_positives_total[1h]))) * 100",
+          "legendFormat": "FP Rate % (1h window)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(fraud_false_positives_total[24h])) / (sum(rate(fraud_false_positives_total[24h])) + sum(rate(fraud_true_positives_total[24h]))) * 100",
+          "legendFormat": "FP Rate % (24h avg)",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(rate(fraud_false_positives_total[7d])) / (sum(rate(fraud_false_positives_total[7d])) + sum(rate(fraud_true_positives_total[7d]))) * 100",
+          "legendFormat": "FP Rate % (7d avg)",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 5,
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "showPoints": "never",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "FP Rate % (1h window)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "FP Rate % (24h avg)" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "FP Rate % (7d avg)" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dot" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Customer Impact: Blocked Legitimate Transactions Over Time",
+      "description": "Count of false positives over time, showing impact on legitimate customers",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(increase(fraud_false_positives_total[1h]))",
+          "legendFormat": "Blocked Legitimate (per hour)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(customer_complaints_total{reason=\"blocked_transaction\"}[1h]))",
+          "legendFormat": "Customer Complaints (per hour)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "drawStyle": "bars",
+            "showPoints": "never",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Blocked Legitimate (per hour)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Customer Complaints (per hour)" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "id": 7,
+      "title": "FP Rate by Transaction Amount Range",
+      "description": "False positive rate broken down by transaction amount bucket",
+      "type": "barchart",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (amount_range) (rate(fraud_false_positives_by_amount_total[6h])) / (sum by (amount_range) (rate(fraud_false_positives_by_amount_total[6h])) + sum by (amount_range) (rate(fraud_true_positives_by_amount_total[6h]))) * 100",
+          "legendFormat": "{{amount_range}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "fillOpacity": 80,
+            "gradientMode": "scheme"
+          },
+          "thresholds": {
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 10, "color": "yellow" },
+              { "value": 20, "color": "red" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "vertical",
+        "legend": { "displayMode": "hidden" },
+        "tooltip": { "mode": "single" },
+        "barWidth": 0.6
+      }
+    },
+    {
+      "id": 8,
+      "title": "FP Rate by Geography (Top 10 Countries)",
+      "description": "False positive rate by billing country -- identifies regions where the model is overly aggressive",
+      "type": "barchart",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 26 },
+      "targets": [
+        {
+          "expr": "topk(10, sum by (billing_country) (rate(fraud_false_positives_by_country_total[24h])) / (sum by (billing_country) (rate(fraud_false_positives_by_country_total[24h])) + sum by (billing_country) (rate(fraud_true_positives_by_country_total[24h]))) * 100)",
+          "legendFormat": "{{billing_country}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "fillOpacity": 80,
+            "gradientMode": "scheme"
+          },
+          "thresholds": {
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 15, "color": "yellow" },
+              { "value": 30, "color": "red" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "legend": { "displayMode": "hidden" },
+        "tooltip": { "mode": "single" },
+        "barWidth": 0.7
+      }
+    }
+  ],
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "tags": ["fraud-detection", "false-positives", "customer-impact"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "label": "Data Source",
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      }
+    ]
+  },
+  "time": { "from": "now-24h", "to": "now" },
+  "timepicker": {
+    "refresh_intervals": ["10s", "30s", "1m", "5m"]
+  },
+  "timezone": "utc",
+  "title": "Fraud Detection - False Positive Rate",
+  "uid": "fraud-fp-rate",
+  "version": 1
+}

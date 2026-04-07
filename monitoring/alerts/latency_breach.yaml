@@ -1,0 +1,111 @@
+# ---------------------------------------------------------------------------
+# PrometheusRule: Latency SLA Breach Alerts
+# ---------------------------------------------------------------------------
+# Monitors p99 inference latency for both the scoring and enrichment services.
+#
+# SLA targets:
+#   - Fraud scoring:     p99 < 50ms
+#   - Feature enrichment: p99 < 30ms
+#
+# Severity levels:
+#   - critical: Scoring p99 > 50ms for 5 minutes (SLA breach)
+#   - warning:  Enrichment p99 > 30ms for 5 minutes
+# ---------------------------------------------------------------------------
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fraud-latency-alerts
+  namespace: fraud-production
+  labels:
+    app.kubernetes.io/name: fraud-detection
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: fraud-detection-mlops
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: fraud-detection.latency
+      interval: 15s
+      rules:
+        # ---------------------------------------------------------------
+        # CRITICAL: Fraud scoring p99 latency exceeds 50ms SLA for 5 min
+        #
+        # The scoring service has a strict SLA of < 50ms p99 to ensure
+        # that fraud decisions do not add noticeable delay to the payment
+        # authorization flow.
+        #
+        # Common causes:
+        #   - Pod resource contention (CPU throttling)
+        #   - Model size increase after retraining
+        #   - Garbage collection pauses
+        #   - Downstream dependency slowdown (MLflow model loading)
+        # ---------------------------------------------------------------
+        - alert: FraudScoringLatencyHigh
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(scoring_latency_seconds_bucket[5m])) by (le)
+            ) > 0.050
+          for: 5m
+          labels:
+            severity: critical
+            team: fraud-detection
+            service: scoring
+            sla: latency
+          annotations:
+            summary: "Fraud scoring p99 latency exceeds 50ms SLA"
+            description: |
+              The fraud scoring service p99 latency has exceeded the 50ms SLA
+              threshold for at least 5 minutes.
+
+              Current p99: {{ $value | printf "%.3f" }}s ({{ $value | printf "%.1f" | mul 1000 }}ms)
+
+              Immediate actions:
+                1. Check pod CPU/memory usage: kubectl top pods -n fraud-production -l app.kubernetes.io/component=scoring
+                2. Verify HPA is scaling: kubectl get hpa -n fraud-production
+                3. Check if a new model version was deployed (larger model = slower inference).
+                4. Review pod logs for errors or warnings.
+                5. If HPA is maxed out, consider manual scale-up.
+            runbook_url: "https://wiki.example.com/runbooks/fraud-detection/latency-sla-breach"
+            dashboard_url: "https://grafana.example.com/d/fraud-latency/model-latency"
+
+        # ---------------------------------------------------------------
+        # WARNING: Feature enrichment p99 latency exceeds 30ms for 5 min
+        #
+        # The enrichment service feeds into the scoring pipeline, so
+        # elevated enrichment latency compounds downstream.
+        #
+        # Common causes:
+        #   - Feast online store (Redis) slowdown
+        #   - Network latency to Redis
+        #   - High cardinality entity lookups
+        # ---------------------------------------------------------------
+        - alert: FraudEnrichmentLatencyHigh
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(enrichment_latency_seconds_bucket[5m])) by (le)
+            ) > 0.030
+          for: 5m
+          labels:
+            severity: warning
+            team: fraud-detection
+            service: enrichment
+            sla: latency
+          annotations:
+            summary: "Feature enrichment p99 latency exceeds 30ms"
+            description: |
+              The feature enrichment service p99 latency has exceeded 30ms
+              for at least 5 minutes.
+
+              Current p99: {{ $value | printf "%.3f" }}s ({{ $value | printf "%.1f" | mul 1000 }}ms)
+
+              The enrichment service is upstream of scoring, so latency here
+              compounds in the end-to-end transaction authorization flow.
+
+              Actions:
+                1. Check Redis online store health: redis-cli -h redis-master ping
+                2. Monitor Redis memory and connection count.
+                3. Check Feast feature freshness (stale features force fallback lookups).
+                4. Review enrichment pod resource usage.
+            runbook_url: "https://wiki.example.com/runbooks/fraud-detection/latency-sla-breach"
+            dashboard_url: "https://grafana.example.com/d/fraud-latency/model-latency"

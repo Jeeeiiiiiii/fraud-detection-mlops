@@ -1,0 +1,450 @@
+# ---------------------------------------------------------------------------
+# Argo Workflow: Fraud Detection Training Pipeline
+# ---------------------------------------------------------------------------
+# Orchestrates the full model lifecycle:
+#   1. validate-data      -- Schema and quality checks on incoming labels.
+#   2. train              -- XGBoost training with Optuna hyperparameter search.
+#   3. evaluate           -- Comprehensive model evaluation.
+#   4. champion-challenger -- Compare new model against production.
+#   5. register           -- Register model in MLflow if it passes gates.
+#   6. deploy-staging     -- Deploy to staging KServe InferenceService.
+#
+# Exit handler sends a Slack notification on success or failure.
+# Trigger: EventSource on new fraud label arrivals (see comments below).
+# ---------------------------------------------------------------------------
+
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: fraud-training-pipeline-
+  namespace: ml-pipelines
+  labels:
+    app.kubernetes.io/name: fraud-detection
+    app.kubernetes.io/component: training-pipeline
+  annotations:
+    # Triggered by an Argo Events sensor when new fraud labels land in GCS.
+    # Schedule can also be set via CronWorkflow (see bottom of file).
+    workflows.argoproj.io/description: |
+      End-to-end fraud model training pipeline. Triggered on new fraud labels.
+spec:
+  entrypoint: fraud-training-pipeline
+  serviceAccountName: argo-workflow-sa
+
+  # ---------------------------------------------------------------------------
+  # Exit handler -- always runs, sends Slack notification
+  # ---------------------------------------------------------------------------
+  onExit: slack-notification
+
+  # ---------------------------------------------------------------------------
+  # Global parameters
+  # ---------------------------------------------------------------------------
+  arguments:
+    parameters:
+      - name: data-path
+        value: "gs://fraud-detection-mlops/data/transactions.parquet"
+      - name: mlflow-uri
+        value: "http://mlflow.ml-infra.svc.cluster.local:5000"
+      - name: n-trials
+        value: "50"
+      - name: model-name
+        value: "fraud-detection-xgb"
+      - name: experiment-name
+        value: "fraud-detection"
+      - name: min-recall
+        value: "0.85"
+      - name: min-precision
+        value: "0.50"
+      - name: slack-webhook-url
+        value: "https://hooks.slack.com/services/REPLACE/WITH/ACTUAL"
+      - name: staging-namespace
+        value: "fraud-staging"
+      - name: training-image
+        value: "gcr.io/fraud-detection-mlops/training:latest"
+
+  # ---------------------------------------------------------------------------
+  # Volume: shared workspace for artefacts between steps
+  # ---------------------------------------------------------------------------
+  volumeClaimTemplates:
+    - metadata:
+        name: workspace
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 10Gi
+        storageClassName: standard
+
+  # ---------------------------------------------------------------------------
+  # Pipeline DAG
+  # ---------------------------------------------------------------------------
+  templates:
+    - name: fraud-training-pipeline
+      dag:
+        tasks:
+          # Step 1: Validate data quality
+          - name: validate-data
+            template: validate-data
+            arguments:
+              parameters:
+                - name: data-path
+                  value: "{{workflow.parameters.data-path}}"
+
+          # Step 2: Train model
+          - name: train
+            template: train-model
+            dependencies: [validate-data]
+            arguments:
+              parameters:
+                - name: data-path
+                  value: "{{workflow.parameters.data-path}}"
+                - name: mlflow-uri
+                  value: "{{workflow.parameters.mlflow-uri}}"
+                - name: n-trials
+                  value: "{{workflow.parameters.n-trials}}"
+                - name: experiment-name
+                  value: "{{workflow.parameters.experiment-name}}"
+
+          # Step 3: Evaluate model
+          - name: evaluate
+            template: evaluate-model
+            dependencies: [train]
+            arguments:
+              parameters:
+                - name: data-path
+                  value: "{{workflow.parameters.data-path}}"
+                - name: mlflow-uri
+                  value: "{{workflow.parameters.mlflow-uri}}"
+                - name: model-name
+                  value: "{{workflow.parameters.model-name}}"
+                - name: model-version
+                  value: "{{tasks.train.outputs.parameters.model-version}}"
+
+          # Step 4: Champion-challenger gate
+          - name: champion-challenger
+            template: champion-challenger-gate
+            dependencies: [evaluate]
+            arguments:
+              parameters:
+                - name: min-recall
+                  value: "{{workflow.parameters.min-recall}}"
+                - name: min-precision
+                  value: "{{workflow.parameters.min-precision}}"
+
+          # Step 5: Register model (only if gate passes)
+          - name: register
+            template: register-model
+            dependencies: [champion-challenger]
+            arguments:
+              parameters:
+                - name: mlflow-uri
+                  value: "{{workflow.parameters.mlflow-uri}}"
+                - name: model-name
+                  value: "{{workflow.parameters.model-name}}"
+                - name: model-version
+                  value: "{{tasks.train.outputs.parameters.model-version}}"
+
+          # Step 6: Deploy to staging
+          - name: deploy-staging
+            template: deploy-staging
+            dependencies: [register]
+            arguments:
+              parameters:
+                - name: model-name
+                  value: "{{workflow.parameters.model-name}}"
+                - name: model-version
+                  value: "{{tasks.train.outputs.parameters.model-version}}"
+                - name: staging-namespace
+                  value: "{{workflow.parameters.staging-namespace}}"
+
+    # -----------------------------------------------------------------------
+    # Step templates
+    # -----------------------------------------------------------------------
+
+    - name: validate-data
+      inputs:
+        parameters:
+          - name: data-path
+      container:
+        image: "{{workflow.parameters.training-image}}"
+        command: ["python", "-c"]
+        args:
+          - |
+            import pandas as pd
+            import sys
+            import json
+
+            data_path = "{{inputs.parameters.data-path}}"
+            print(f"Validating data at {data_path}")
+
+            df = pd.read_parquet(data_path)
+
+            # Schema checks
+            required_cols = [
+                "transaction_id", "user_id", "amount", "merchant_category",
+                "card_type", "device_type", "ip_country", "billing_country",
+                "shipping_country", "timestamp", "is_fraud",
+            ]
+            missing = [c for c in required_cols if c not in df.columns]
+            if missing:
+                print(f"FAIL: Missing columns: {missing}")
+                sys.exit(1)
+
+            # Null checks
+            null_pct = df[required_cols].isnull().mean()
+            high_null = null_pct[null_pct > 0.05]
+            if not high_null.empty:
+                print(f"FAIL: High null rates:\n{high_null}")
+                sys.exit(1)
+
+            # Fraud label distribution
+            fraud_rate = df["is_fraud"].mean()
+            if fraud_rate < 0.001 or fraud_rate > 0.2:
+                print(f"WARN: Unusual fraud rate: {fraud_rate:.4f}")
+
+            # Row count sanity
+            if len(df) < 1000:
+                print(f"FAIL: Too few rows: {len(df)}")
+                sys.exit(1)
+
+            print(f"PASS: {len(df)} rows, fraud_rate={fraud_rate:.4f}")
+            print(json.dumps({"rows": len(df), "fraud_rate": round(fraud_rate, 4)}))
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+        resources:
+          requests:
+            memory: "1Gi"
+            cpu: "500m"
+          limits:
+            memory: "2Gi"
+            cpu: "1"
+
+    - name: train-model
+      inputs:
+        parameters:
+          - name: data-path
+          - name: mlflow-uri
+          - name: n-trials
+          - name: experiment-name
+      outputs:
+        parameters:
+          - name: model-version
+            valueFrom:
+              path: /workspace/model_version.txt
+          - name: metrics
+            valueFrom:
+              path: /workspace/train_metrics.json
+      container:
+        image: "{{workflow.parameters.training-image}}"
+        command: ["python", "-m", "training.train"]
+        args:
+          - "--data-path"
+          - "{{inputs.parameters.data-path}}"
+          - "--mlflow-uri"
+          - "{{inputs.parameters.mlflow-uri}}"
+          - "--n-trials"
+          - "{{inputs.parameters.n-trials}}"
+          - "--experiment-name"
+          - "{{inputs.parameters.experiment-name}}"
+        env:
+          - name: MLFLOW_TRACKING_URI
+            value: "{{inputs.parameters.mlflow-uri}}"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+            nvidia.com/gpu: "0"
+
+    - name: evaluate-model
+      inputs:
+        parameters:
+          - name: data-path
+          - name: mlflow-uri
+          - name: model-name
+          - name: model-version
+      container:
+        image: "{{workflow.parameters.training-image}}"
+        command: ["python", "-m", "training.evaluate"]
+        args:
+          - "--data-path"
+          - "{{inputs.parameters.data-path}}"
+          - "--mlflow-uri"
+          - "{{inputs.parameters.mlflow-uri}}"
+          - "--model-name"
+          - "{{inputs.parameters.model-name}}"
+          - "--model-version"
+          - "{{inputs.parameters.model-version}}"
+          - "--output-path"
+          - "/workspace/evaluation_report.json"
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+        resources:
+          requests:
+            memory: "2Gi"
+            cpu: "1"
+          limits:
+            memory: "4Gi"
+            cpu: "2"
+
+    - name: champion-challenger-gate
+      inputs:
+        parameters:
+          - name: min-recall
+          - name: min-precision
+      script:
+        image: python:3.11-slim
+        command: ["python"]
+        source: |
+          import json
+          import sys
+
+          with open("/workspace/evaluation_report.json") as f:
+              report = json.load(f)
+
+          metrics = report["overall_metrics"]
+          recall = metrics["recall"]
+          precision = metrics["precision"]
+          min_recall = float("{{inputs.parameters.min-recall}}")
+          min_precision = float("{{inputs.parameters.min-precision}}")
+
+          print(f"Recall:    {recall:.4f} (min: {min_recall})")
+          print(f"Precision: {precision:.4f} (min: {min_precision})")
+
+          # Check champion-challenger result if available
+          cc = report.get("champion_challenger", {})
+          if cc and cc.get("recommendation") == "REJECT":
+              print(f"GATE FAILED: Champion-challenger recommends REJECT")
+              print(f"  Recall delta:    {cc.get('recall_delta', 'N/A')}")
+              print(f"  Precision delta: {cc.get('precision_delta', 'N/A')}")
+              sys.exit(1)
+
+          if recall < min_recall:
+              print(f"GATE FAILED: recall {recall:.4f} < {min_recall}")
+              sys.exit(1)
+
+          if precision < min_precision:
+              print(f"GATE FAILED: precision {precision:.4f} < {min_precision}")
+              sys.exit(1)
+
+          print("GATE PASSED: Model meets quality thresholds.")
+        volumeMounts:
+          - name: workspace
+            mountPath: /workspace
+
+    - name: register-model
+      inputs:
+        parameters:
+          - name: mlflow-uri
+          - name: model-name
+          - name: model-version
+      script:
+        image: "{{workflow.parameters.training-image}}"
+        command: ["python"]
+        source: |
+          import mlflow
+
+          mlflow.set_tracking_uri("{{inputs.parameters.mlflow-uri}}")
+          client = mlflow.MlflowClient()
+
+          model_name = "{{inputs.parameters.model-name}}"
+          version = "{{inputs.parameters.model-version}}"
+
+          # Transition the new model to Staging
+          client.transition_model_version_stage(
+              name=model_name,
+              version=version,
+              stage="Staging",
+              archive_existing_versions=False,
+          )
+          print(f"Model {model_name} v{version} transitioned to Staging.")
+
+    - name: deploy-staging
+      inputs:
+        parameters:
+          - name: model-name
+          - name: model-version
+          - name: staging-namespace
+      script:
+        image: bitnami/kubectl:latest
+        command: ["sh"]
+        source: |
+          cat <<EOSPEC | kubectl apply -n {{inputs.parameters.staging-namespace}} -f -
+          apiVersion: serving.kserve.io/v1beta1
+          kind: InferenceService
+          metadata:
+            name: fraud-detection-staging
+            labels:
+              app: fraud-detection
+              environment: staging
+          spec:
+            predictor:
+              model:
+                modelFormat:
+                  name: xgboost
+                storageUri: "gs://fraud-detection-mlops/models/{{inputs.parameters.model-name}}/{{inputs.parameters.model-version}}"
+                resources:
+                  requests:
+                    cpu: "1"
+                    memory: "2Gi"
+                  limits:
+                    cpu: "2"
+                    memory: "4Gi"
+          EOSPEC
+          echo "Staging deployment applied for v{{inputs.parameters.model-version}}"
+
+    # -----------------------------------------------------------------------
+    # Exit handler: Slack notification
+    # -----------------------------------------------------------------------
+    - name: slack-notification
+      script:
+        image: curlimages/curl:latest
+        command: ["sh"]
+        source: |
+          STATUS="{{workflow.status}}"
+          NAME="{{workflow.name}}"
+          WEBHOOK="{{workflow.parameters.slack-webhook-url}}"
+
+          if [ "$STATUS" = "Succeeded" ]; then
+            EMOJI=":white_check_mark:"
+            COLOR="good"
+          else
+            EMOJI=":x:"
+            COLOR="danger"
+          fi
+
+          curl -X POST "$WEBHOOK" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"attachments\": [{
+                \"color\": \"$COLOR\",
+                \"title\": \"$EMOJI Fraud Model Training Pipeline: $STATUS\",
+                \"text\": \"Workflow: $NAME\\nStatus: $STATUS\",
+                \"footer\": \"fraud-detection-mlops\",
+                \"ts\": $(date +%s)
+              }]
+            }"
+
+---
+# ---------------------------------------------------------------------------
+# CronWorkflow variant -- scheduled re-training (optional)
+# ---------------------------------------------------------------------------
+# Uncomment to enable weekly re-training in addition to event-triggered runs.
+#
+# apiVersion: argoproj.io/v1alpha1
+# kind: CronWorkflow
+# metadata:
+#   name: fraud-training-weekly
+#   namespace: ml-pipelines
+# spec:
+#   schedule: "0 2 * * 1"  # Every Monday at 02:00 UTC
+#   timezone: "UTC"
+#   concurrencyPolicy: Forbid
+#   workflowSpec:
+#     # (same spec as above)

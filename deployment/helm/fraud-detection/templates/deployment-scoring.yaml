@@ -1,0 +1,107 @@
+{{- if .Values.scoring.enabled }}
+# ---------------------------------------------------------------------------
+# Scoring Service Deployment
+# ---------------------------------------------------------------------------
+# Configured with pod anti-affinity and topology spread constraints to
+# ensure high availability across failure domains.
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fraud-detection.fullname" . }}-scoring
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "fraud-detection.scoring.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.scoring.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "fraud-detection.scoring.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "fraud-detection.scoring.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ include "fraud-detection.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+
+      # Anti-affinity: avoid co-locating scoring pods on the same node/zone
+      {{- if .Values.scoring.affinity }}
+      affinity:
+        {{- toYaml .Values.scoring.affinity | nindent 8 }}
+      {{- end }}
+
+      # Topology spread: even distribution across zones
+      {{- if .Values.scoring.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml .Values.scoring.topologySpreadConstraints | nindent 8 }}
+      {{- end }}
+
+      containers:
+        - name: scoring
+          image: {{ include "fraud-detection.image" (dict "global" .Values.global "image" .Values.scoring.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: SERVICE_PORT
+              value: "8080"
+            - name: MLFLOW_TRACKING_URI
+              value: {{ .Values.scoring.mlflow.trackingUri | quote }}
+            - name: MODEL_NAME
+              value: {{ .Values.scoring.model.name | quote }}
+            - name: MODEL_VERSION
+              value: {{ .Values.scoring.model.version | quote }}
+            - name: REVIEW_THRESHOLD
+              value: {{ .Values.scoring.thresholds.review | quote }}
+            - name: BLOCK_THRESHOLD
+              value: {{ .Values.scoring.thresholds.block | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.scoring.env.LOG_LEVEL | quote }}
+            - name: MAX_BATCH_SIZE
+              value: {{ .Values.scoring.env.MAX_BATCH_SIZE | quote }}
+          resources:
+            {{- toYaml .Values.scoring.resources | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.scoring.readinessProbe | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.scoring.livenessProbe | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+{{- if .Values.scoring.podDisruptionBudget }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "fraud-detection.fullname" . }}-scoring
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "fraud-detection.scoring.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.scoring.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "fraud-detection.scoring.selectorLabels" . | nindent 6 }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,19 @@
+apiVersion: v2
+name: fraud-detection
+description: |
+  Helm chart for the Fraud Detection MLOps platform.
+  Deploys the feature enrichment service and fraud scoring service
+  with configurable thresholds, autoscaling, and monitoring.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"
+keywords:
+  - fraud-detection
+  - mlops
+  - machine-learning
+  - xgboost
+home: https://github.com/your-org/fraud-detection-mlops
+maintainers:
+  - name: ML Platform Team
+    email: ml-platform@example.com
+dependencies: []

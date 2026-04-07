@@ -1,0 +1,417 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source for fraud detection metrics",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": "-- Grafana --",
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": "${DS_PROMETHEUS}",
+        "enable": true,
+        "expr": "ALERTS{alertname=~\"FraudBlockRate.*\", alertstate=\"firing\"}",
+        "iconColor": "red",
+        "name": "Block Rate Alerts",
+        "titleFormat": "{{alertname}}"
+      }
+    ]
+  },
+  "description": "Fraud rate monitoring: overall rates, decision breakdown, trends by category",
+  "editable": true,
+  "gnetId": null,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    {
+      "icon": "external link",
+      "tags": ["fraud-detection"],
+      "title": "False Positive Dashboard",
+      "type": "link",
+      "url": "/d/fraud-fp-rate/false-positive-rate"
+    },
+    {
+      "icon": "external link",
+      "tags": ["fraud-detection"],
+      "title": "Model Latency Dashboard",
+      "type": "link",
+      "url": "/d/fraud-latency/model-latency"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "title": "Overall Fraud Block Rate",
+      "description": "Percentage of transactions blocked as fraudulent over the selected time window",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(block_rate[5m])) / (sum(rate(block_rate[5m])) + sum(rate(review_rate[5m])) + sum(rate(allow_rate[5m]))) * 100",
+          "legendFormat": "Block Rate %",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 5, "color": "yellow" },
+              { "value": 15, "color": "orange" },
+              { "value": 25, "color": "red" }
+            ]
+          },
+          "mappings": [],
+          "decimals": 2
+        }
+      },
+      "options": {
+        "reduceOptions": {
+          "calcs": ["lastNotNull"],
+          "fields": "",
+          "values": false
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 2,
+      "title": "Review Rate",
+      "description": "Percentage of transactions sent for manual review",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(review_rate[5m])) / (sum(rate(block_rate[5m])) + sum(rate(review_rate[5m])) + sum(rate(allow_rate[5m]))) * 100",
+          "legendFormat": "Review Rate %",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 10, "color": "yellow" },
+              { "value": 20, "color": "red" }
+            ]
+          },
+          "decimals": 2
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 3,
+      "title": "Transactions Scored (per second)",
+      "description": "Total throughput of the scoring service",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(scoring_requests_total{status=\"success\"}[5m]))",
+          "legendFormat": "req/s",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "value": null, "color": "blue" }
+            ]
+          },
+          "decimals": 1
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "id": 4,
+      "title": "Model Version",
+      "description": "Currently deployed model version",
+      "type": "stat",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "expr": "fraud_model_version_info",
+          "legendFormat": "{{model_version}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "string",
+          "thresholds": {
+            "steps": [{ "value": null, "color": "blue" }]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "colorMode": "background",
+        "textMode": "name"
+      }
+    },
+    {
+      "id": 5,
+      "title": "Decision Breakdown (Blocked / Reviewed / Allowed)",
+      "description": "Proportion of transactions by decision outcome",
+      "type": "piechart",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 10, "w": 8, "x": 0, "y": 6 },
+      "targets": [
+        {
+          "expr": "sum(increase(block_rate[1h]))",
+          "legendFormat": "Blocked",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(increase(review_rate[1h]))",
+          "legendFormat": "Reviewed",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(increase(allow_rate[1h]))",
+          "legendFormat": "Allowed",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Blocked" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Reviewed" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Allowed" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          }
+        ]
+      },
+      "options": {
+        "pieType": "donut",
+        "reduceOptions": { "calcs": ["lastNotNull"] },
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "values": ["value", "percent"]
+        },
+        "tooltip": { "mode": "single" }
+      }
+    },
+    {
+      "id": 6,
+      "title": "Fraud Rate Over Time",
+      "description": "Block, review, and allow rates as time series to spot trends",
+      "type": "timeseries",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 10, "w": 16, "x": 8, "y": 6 },
+      "targets": [
+        {
+          "expr": "sum(rate(block_rate[5m])) / (sum(rate(block_rate[5m])) + sum(rate(review_rate[5m])) + sum(rate(allow_rate[5m]))) * 100",
+          "legendFormat": "Block Rate %",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(review_rate[5m])) / (sum(rate(block_rate[5m])) + sum(rate(review_rate[5m])) + sum(rate(allow_rate[5m]))) * 100",
+          "legendFormat": "Review Rate %",
+          "refId": "B"
+        },
+        {
+          "expr": "(sum(rate(block_rate[5m])) + sum(rate(review_rate[5m]))) / (sum(rate(block_rate[5m])) + sum(rate(review_rate[5m])) + sum(rate(allow_rate[5m]))) * 100",
+          "legendFormat": "Total Flagged %",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "drawStyle": "line",
+            "lineInterpolation": "smooth",
+            "showPoints": "never",
+            "axisSoftMin": 0
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "Block Rate %" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Review Rate %" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "Total Flagged %" },
+            "properties": [
+              { "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } },
+              { "id": "custom.lineStyle", "value": { "fill": "dash", "dash": [10, 10] } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom" },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "id": 7,
+      "title": "Block Rate by Merchant Category",
+      "description": "Fraud block rate broken down by merchant category to identify high-risk segments",
+      "type": "barchart",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 10, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum by (merchant_category) (rate(block_rate_by_category[1h])) / sum by (merchant_category) (rate(scoring_requests_by_category_total[1h])) * 100",
+          "legendFormat": "{{merchant_category}}",
+          "refId": "A",
+          "instant": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "axisSoftMin": 0,
+            "fillOpacity": 80,
+            "gradientMode": "scheme"
+          },
+          "thresholds": {
+            "steps": [
+              { "value": null, "color": "green" },
+              { "value": 10, "color": "yellow" },
+              { "value": 25, "color": "red" }
+            ]
+          }
+        }
+      },
+      "options": {
+        "orientation": "horizontal",
+        "legend": { "displayMode": "hidden" },
+        "tooltip": { "mode": "single" },
+        "xTickLabelRotation": -45,
+        "barWidth": 0.7
+      }
+    },
+    {
+      "id": 8,
+      "title": "Fraud Score Distribution",
+      "description": "Histogram of fraud scores returned by the model to understand score calibration",
+      "type": "histogram",
+      "datasource": "${DS_PROMETHEUS}",
+      "gridPos": { "h": 10, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(increase(fraud_score_bucket[1h])) by (le)",
+          "legendFormat": "{{le}}",
+          "refId": "A",
+          "format": "heatmap"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": { "mode": "scheme", "schemeType": "BuGn" },
+          "custom": {
+            "fillOpacity": 80,
+            "gradientMode": "scheme"
+          }
+        }
+      },
+      "options": {
+        "bucketSize": 0.1,
+        "combine": false,
+        "legend": { "displayMode": "hidden" },
+        "tooltip": { "mode": "single" }
+      }
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["fraud-detection", "mlops", "production"],
+  "templating": {
+    "list": [
+      {
+        "current": { "selected": false, "text": "Prometheus", "value": "Prometheus" },
+        "hide": 0,
+        "includeAll": false,
+        "label": "Data Source",
+        "multi": false,
+        "name": "DS_PROMETHEUS",
+        "options": [],
+        "query": "prometheus",
+        "refresh": 1,
+        "type": "datasource"
+      },
+      {
+        "current": { "selected": false, "text": "fraud-production", "value": "fraud-production" },
+        "hide": 0,
+        "label": "Namespace",
+        "name": "namespace",
+        "options": [
+          { "selected": true, "text": "fraud-production", "value": "fraud-production" },
+          { "selected": false, "text": "fraud-staging", "value": "fraud-staging" }
+        ],
+        "type": "custom"
+      }
+    ]
+  },
+  "time": { "from": "now-6h", "to": "now" },
+  "timepicker": {
+    "refresh_intervals": ["5s", "10s", "30s", "1m", "5m"]
+  },
+  "timezone": "utc",
+  "title": "Fraud Detection - Fraud Rate",
+  "uid": "fraud-rate-overview",
+  "version": 1
+}

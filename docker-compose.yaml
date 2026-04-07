@@ -1,0 +1,104 @@
+# Local development stack for fraud-detection-mlops.
+# Runs all services needed for end-to-end testing alongside payment-service.
+#
+# Usage:
+#   docker-compose up --build
+#
+# The scoring service falls back to a stub model when MLflow has no registered
+# model yet. Train one with:
+#   docker-compose exec scoring-service python -c "
+#     import sys; sys.path.insert(0, '/app');
+#     from training.train import train;
+#     train(data_path='/app/data/output/transactions.parquet', mlflow_uri='http://mlflow:5000', n_trials=5)
+#   "
+
+services:
+  # --- Feature Enrichment Service ---
+  enrichment-service:
+    build:
+      context: .
+      dockerfile: features/enrichment_service/Dockerfile
+    ports:
+      - "8081:8081"
+    environment:
+      FEAST_REPO_PATH: /app/features/feast
+      SERVICE_PORT: "8081"
+      LOG_LEVEL: INFO
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8081/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # --- Fraud Scoring Service ---
+  # Exposes /score (internal) and /predict (payment-service compatible)
+  scoring-service:
+    build:
+      context: .
+      dockerfile: serving/Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MODEL_NAME: fraud-detection-xgb
+      MODEL_VERSION: latest
+      REVIEW_THRESHOLD: "0.7"
+      BLOCK_THRESHOLD: "0.9"
+      SERVICE_PORT: "8080"
+      LOG_LEVEL: INFO
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # --- MLflow Tracking Server ---
+  # Experiment tracking + model registry with SQLite backend
+  mlflow:
+    image: python:3.11-slim
+    ports:
+      - "5000:5000"
+    command: >
+      bash -c "pip install --quiet mlflow==2.14.0 &&
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:///mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts"
+    volumes:
+      - mlflow-data:/mlflow
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:5000/health')"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # --- Prometheus ---
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus-local.yaml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - scoring-service
+      - enrichment-service
+
+  # --- Grafana ---
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    depends_on:
+      - prometheus
+
+volumes:
+  mlflow-data:

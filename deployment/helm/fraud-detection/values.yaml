@@ -1,0 +1,203 @@
+# ---------------------------------------------------------------------------
+# Default values for fraud-detection Helm chart
+# ---------------------------------------------------------------------------
+# Override these in your environment-specific values files:
+#   helm install fraud-detection . -f values-staging.yaml
+# ---------------------------------------------------------------------------
+
+global:
+  # Container registry prefix
+  imageRegistry: gcr.io/fraud-detection-mlops
+  imagePullPolicy: IfNotPresent
+  # Kubernetes namespace (can be overridden at install time)
+  namespace: fraud-production
+
+# ---------------------------------------------------------------------------
+# Enrichment Service
+# ---------------------------------------------------------------------------
+enrichment:
+  enabled: true
+  replicaCount: 2
+
+  image:
+    repository: enrichment
+    tag: "latest"
+
+  service:
+    type: ClusterIP
+    port: 8081
+
+  resources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+    limits:
+      cpu: "1"
+      memory: "2Gi"
+
+  # Feast feature store configuration
+  feast:
+    repoPath: /app/features/feast
+    redisUrl: "redis://redis-master.fraud-detection.svc.cluster.local:6379"
+
+  # Autoscaling
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+
+  # Pod disruption budget
+  podDisruptionBudget:
+    minAvailable: 1
+
+  # Probes
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 8081
+    initialDelaySeconds: 5
+    periodSeconds: 10
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8081
+    initialDelaySeconds: 10
+    periodSeconds: 15
+
+  env:
+    LOG_LEVEL: "INFO"
+
+# ---------------------------------------------------------------------------
+# Scoring Service
+# ---------------------------------------------------------------------------
+scoring:
+  enabled: true
+  replicaCount: 3
+
+  image:
+    repository: scoring
+    tag: "latest"
+
+  service:
+    type: ClusterIP
+    port: 8080
+
+  resources:
+    requests:
+      cpu: "1"
+      memory: "2Gi"
+    limits:
+      cpu: "2"
+      memory: "4Gi"
+
+  # Model configuration
+  model:
+    name: fraud-detection-xgb
+    version: "latest"
+
+  # Decision thresholds (tune per business requirements)
+  thresholds:
+    review: 0.7
+    block: 0.9
+
+  # MLflow configuration
+  mlflow:
+    trackingUri: "http://mlflow.ml-infra.svc.cluster.local:5000"
+
+  # Autoscaling -- scale on both CPU and custom latency metric
+  autoscaling:
+    enabled: true
+    minReplicas: 3
+    maxReplicas: 20
+    targetCPUUtilizationPercentage: 60
+    # Custom metric: scale if p99 latency exceeds 30ms (buffer below 50ms SLA)
+    customMetrics:
+      enabled: true
+      latencyMetric: scoring_latency_seconds
+      latencyThresholdMs: 30
+
+  # Anti-affinity and topology spread
+  affinity:
+    podAntiAffinity:
+      preferredDuringSchedulingIgnoredDuringExecution:
+        - weight: 100
+          podAffinityTerm:
+            labelSelector:
+              matchExpressions:
+                - key: app.kubernetes.io/component
+                  operator: In
+                  values:
+                    - scoring
+            topologyKey: topology.kubernetes.io/zone
+
+  topologySpreadConstraints:
+    - maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+      labelSelector:
+        matchLabels:
+          app.kubernetes.io/component: scoring
+
+  # Pod disruption budget
+  podDisruptionBudget:
+    minAvailable: 2
+
+  # Probes
+  readinessProbe:
+    httpGet:
+      path: /health
+      port: 8080
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 3
+  livenessProbe:
+    httpGet:
+      path: /health
+      port: 8080
+    initialDelaySeconds: 10
+    periodSeconds: 15
+    timeoutSeconds: 3
+
+  env:
+    LOG_LEVEL: "INFO"
+    MAX_BATCH_SIZE: "200"
+
+# ---------------------------------------------------------------------------
+# Feature Store (shared config)
+# ---------------------------------------------------------------------------
+featureStore:
+  # Feast project name
+  project: fraud_detection
+  # Registry location
+  registry: "gs://fraud-detection-mlops/feast/registry.db"
+  # Online store
+  onlineStore:
+    type: redis
+    connectionString: "redis://redis-master.fraud-detection.svc.cluster.local:6379"
+
+# ---------------------------------------------------------------------------
+# Monitoring
+# ---------------------------------------------------------------------------
+monitoring:
+  # Enable ServiceMonitor for Prometheus Operator
+  serviceMonitor:
+    enabled: true
+    interval: 15s
+    labels:
+      release: prometheus
+
+  # Enable PrometheusRule for alerting
+  prometheusRules:
+    enabled: true
+
+# ---------------------------------------------------------------------------
+# Common settings
+# ---------------------------------------------------------------------------
+nodeSelector: {}
+tolerations: []
+
+serviceAccount:
+  create: true
+  name: fraud-detection-sa
+  annotations: {}

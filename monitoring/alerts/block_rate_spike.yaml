@@ -1,0 +1,102 @@
+# ---------------------------------------------------------------------------
+# PrometheusRule: Fraud Block Rate Alerts
+# ---------------------------------------------------------------------------
+# Detects abnormal increases in the fraud block rate which may indicate:
+#   - A model regression (blocking too many legitimate transactions)
+#   - A genuine fraud attack (sudden surge in fraudulent activity)
+#   - A data pipeline issue (stale or corrupted features)
+#
+# Two severity levels:
+#   1. critical -- block rate spikes >50% vs 24hr average for 15 minutes
+#   2. warning  -- block rate exceeds 20% absolute for 30 minutes
+# ---------------------------------------------------------------------------
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: fraud-block-rate-alerts
+  namespace: fraud-production
+  labels:
+    app.kubernetes.io/name: fraud-detection
+    app.kubernetes.io/component: monitoring
+    app.kubernetes.io/part-of: fraud-detection-mlops
+    prometheus: kube-prometheus
+    role: alert-rules
+spec:
+  groups:
+    - name: fraud-detection.block-rate
+      interval: 30s
+      rules:
+        # ---------------------------------------------------------------
+        # CRITICAL: Block rate has increased >50% compared to the 24-hour
+        # rolling average, sustained for at least 15 minutes.
+        #
+        # This catches both model regressions (false positives surge)
+        # and real fraud attacks. The on-call engineer should:
+        #   1. Check if a new model version was recently deployed.
+        #   2. Inspect the feature pipeline for stale data.
+        #   3. Compare shadow vs production metrics if applicable.
+        #   4. Consider rolling back if the spike is model-related.
+        # ---------------------------------------------------------------
+        - alert: FraudBlockRateSpike
+          expr: |
+            (
+              sum(rate(block_rate[15m]))
+              / sum(rate(block_rate[15m]) + rate(review_rate[15m]) + rate(allow_rate[15m]))
+            )
+            /
+            (
+              sum(rate(block_rate[24h]))
+              / sum(rate(block_rate[24h]) + rate(review_rate[24h]) + rate(allow_rate[24h]))
+            )
+            > 1.5
+          for: 15m
+          labels:
+            severity: critical
+            team: fraud-detection
+            service: scoring
+          annotations:
+            summary: "Fraud block rate has spiked >50% vs 24-hour average"
+            description: |
+              The fraud block rate has increased more than 50% compared to the
+              24-hour rolling average and has been sustained for at least 15 minutes.
+
+              Current block rate ratio vs baseline: {{ $value | printf "%.2f" }}x
+
+              This may indicate a model regression, data pipeline issue, or a
+              genuine fraud attack. Immediate investigation is required.
+            runbook_url: "https://wiki.example.com/runbooks/fraud-detection/incident-high-block-rate"
+            dashboard_url: "https://grafana.example.com/d/fraud-rate-overview/fraud-rate"
+
+        # ---------------------------------------------------------------
+        # WARNING: Absolute block rate exceeds 20% for 30 minutes.
+        #
+        # Even if the relative change is small, an absolute block rate
+        # above 20% is abnormally high and warrants investigation.
+        # ---------------------------------------------------------------
+        - alert: FraudBlockRateHigh
+          expr: |
+            sum(rate(block_rate[30m]))
+            / sum(rate(block_rate[30m]) + rate(review_rate[30m]) + rate(allow_rate[30m]))
+            > 0.20
+          for: 30m
+          labels:
+            severity: warning
+            team: fraud-detection
+            service: scoring
+          annotations:
+            summary: "Fraud block rate exceeds 20% for 30 minutes"
+            description: |
+              The absolute fraud block rate has exceeded 20% for the last 30 minutes.
+              Current rate: {{ $value | printf "%.2f" }}
+
+              Normal operating range is 1-5%. A rate above 20% strongly suggests
+              a systemic issue with the model or feature pipeline.
+
+              Actions:
+                1. Check recent model deployments in MLflow.
+                2. Verify Feast feature freshness.
+                3. Review the false positive rate dashboard for customer impact.
+                4. If model-related, initiate rollback per the runbook.
+            runbook_url: "https://wiki.example.com/runbooks/fraud-detection/incident-high-block-rate"
+            dashboard_url: "https://grafana.example.com/d/fraud-rate-overview/fraud-rate"

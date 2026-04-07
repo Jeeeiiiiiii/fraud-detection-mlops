@@ -1,0 +1,83 @@
+{{- if .Values.enrichment.enabled }}
+# ---------------------------------------------------------------------------
+# Enrichment Service Deployment
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fraud-detection.fullname" . }}-enrichment
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "fraud-detection.enrichment.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.enrichment.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "fraud-detection.enrichment.selectorLabels" . | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        {{- include "fraud-detection.enrichment.selectorLabels" . | nindent 8 }}
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ include "fraud-detection.serviceAccountName" . }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1001
+        runAsGroup: 1001
+        fsGroup: 1001
+      containers:
+        - name: enrichment
+          image: {{ include "fraud-detection.image" (dict "global" .Values.global "image" .Values.enrichment.image) }}
+          imagePullPolicy: {{ .Values.global.imagePullPolicy }}
+          ports:
+            - name: http
+              containerPort: 8081
+              protocol: TCP
+          env:
+            - name: SERVICE_PORT
+              value: "8081"
+            - name: FEAST_REPO_PATH
+              value: {{ .Values.enrichment.feast.repoPath | quote }}
+            - name: REDIS_URL
+              value: {{ .Values.enrichment.feast.redisUrl | quote }}
+            - name: LOG_LEVEL
+              value: {{ .Values.enrichment.env.LOG_LEVEL | quote }}
+          resources:
+            {{- toYaml .Values.enrichment.resources | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.enrichment.readinessProbe | nindent 12 }}
+          livenessProbe:
+            {{- toYaml .Values.enrichment.livenessProbe | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+{{- if .Values.enrichment.podDisruptionBudget }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "fraud-detection.fullname" . }}-enrichment
+  namespace: {{ .Values.global.namespace }}
+  labels:
+    {{- include "fraud-detection.enrichment.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.enrichment.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "fraud-detection.enrichment.selectorLabels" . | nindent 6 }}
+{{- end }}
+{{- end }}

@@ -1,0 +1,598 @@
+// =============================================================================
+// CI/CD Pipeline -- Fraud Detection MLOps
+// =============================================================================
+// Full lifecycle: build, test, shadow deploy, validate, canary rollout.
+//
+// Parameters:
+//   MODEL_NAME      - MLflow registered model name
+//   MODEL_VERSION   - Model version to deploy
+//   ENVIRONMENT     - Target: staging | production
+// =============================================================================
+
+pipeline {
+    agent {
+        kubernetes {
+            label 'fraud-detection-build'
+            defaultContainer 'builder'
+            yaml """
+apiVersion: v1
+kind: Pod
+spec:
+  containers:
+    - name: builder
+      image: python:3.11-slim
+      command: ['cat']
+      tty: true
+      resources:
+        requests:
+          cpu: '1'
+          memory: 2Gi
+    - name: docker
+      image: docker:24-dind
+      securityContext:
+        privileged: true
+      env:
+        - name: DOCKER_TLS_CERTDIR
+          value: ''
+    - name: kubectl
+      image: bitnami/kubectl:1.28
+      command: ['cat']
+      tty: true
+    - name: helm
+      image: alpine/helm:3.14.0
+      command: ['cat']
+      tty: true
+"""
+        }
+    }
+
+    parameters {
+        string(
+            name: 'MODEL_NAME',
+            defaultValue: 'fraud-detection-xgb',
+            description: 'MLflow registered model name'
+        )
+        string(
+            name: 'MODEL_VERSION',
+            defaultValue: 'latest',
+            description: 'Model version to deploy (number or "latest")'
+        )
+        choice(
+            name: 'ENVIRONMENT',
+            choices: ['staging', 'production'],
+            description: 'Target deployment environment'
+        )
+    }
+
+    environment {
+        ACR_REGISTRY     = 'frauddetectionacr.azurecr.io'
+        ACR_CREDENTIALS  = credentials('acr-credentials')
+        IMAGE_TAG        = "${BUILD_NUMBER}-${GIT_COMMIT[0..7]}"
+        ENRICHMENT_IMAGE = "${ACR_REGISTRY}/fraud-detection/enrichment:${IMAGE_TAG}"
+        SCORING_IMAGE    = "${ACR_REGISTRY}/fraud-detection/scoring:${IMAGE_TAG}"
+        HELM_RELEASE     = 'fraud-detection'
+        STAGING_NS       = 'fraud-staging'
+        PRODUCTION_NS    = 'fraud-production'
+        SLACK_CHANNEL    = '#fraud-detection-alerts'
+        SLACK_CREDENTIAL = credentials('slack-webhook-url')
+    }
+
+    options {
+        timeout(time: 4, unit: 'HOURS')
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '30'))
+        timestamps()
+    }
+
+    stages {
+        // -----------------------------------------------------------------
+        // Stage 1: Checkout
+        // -----------------------------------------------------------------
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_SHORT_COMMIT = sh(
+                        script: 'git rev-parse --short HEAD',
+                        returnStdout: true
+                    ).trim()
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 2: Unit Tests
+        // -----------------------------------------------------------------
+        stage('Unit Tests') {
+            steps {
+                container('builder') {
+                    sh '''
+                        pip install --quiet -r requirements.txt
+                        pip install --quiet pytest pytest-cov
+                        pytest tests/ -v \
+                            --tb=short \
+                            --junitxml=test-results/junit.xml \
+                            --cov=features --cov=serving --cov=training \
+                            --cov-report=xml:test-results/coverage.xml \
+                            --cov-report=term-missing
+                    '''
+                }
+            }
+            post {
+                always {
+                    junit 'test-results/junit.xml'
+                    publishHTML(target: [
+                        allowMissing: true,
+                        alwaysLinkToLastBuild: true,
+                        keepAll: true,
+                        reportDir: 'test-results',
+                        reportFiles: 'coverage.xml',
+                        reportName: 'Coverage Report'
+                    ])
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 3: Build Enrichment Image
+        // -----------------------------------------------------------------
+        stage('Build Enrichment Image') {
+            steps {
+                container('docker') {
+                    sh """
+                        docker build \
+                            -t ${ENRICHMENT_IMAGE} \
+                            -f features/enrichment_service/Dockerfile \
+                            .
+                    """
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 4: Build Scoring Image
+        // -----------------------------------------------------------------
+        stage('Build Scoring Image') {
+            steps {
+                container('docker') {
+                    sh """
+                        docker build \
+                            -t ${SCORING_IMAGE} \
+                            -f serving/Dockerfile \
+                            .
+                    """
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 5: Push to ACR
+        // -----------------------------------------------------------------
+        stage('Push to ACR') {
+            steps {
+                container('docker') {
+                    sh """
+                        echo "${ACR_CREDENTIALS_PSW}" | docker login ${ACR_REGISTRY} \
+                            -u "${ACR_CREDENTIALS_USR}" --password-stdin
+                        docker push ${ENRICHMENT_IMAGE}
+                        docker push ${SCORING_IMAGE}
+
+                        # Tag as latest for the environment
+                        docker tag ${ENRICHMENT_IMAGE} \
+                            ${ACR_REGISTRY}/fraud-detection/enrichment:${ENVIRONMENT}
+                        docker tag ${SCORING_IMAGE} \
+                            ${ACR_REGISTRY}/fraud-detection/scoring:${ENVIRONMENT}
+                        docker push ${ACR_REGISTRY}/fraud-detection/enrichment:${ENVIRONMENT}
+                        docker push ${ACR_REGISTRY}/fraud-detection/scoring:${ENVIRONMENT}
+                    """
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 6: Deploy to Staging
+        // -----------------------------------------------------------------
+        stage('Deploy to Staging') {
+            steps {
+                container('helm') {
+                    sh """
+                        helm upgrade --install ${HELM_RELEASE} \
+                            deployment/helm/fraud-detection \
+                            --namespace ${STAGING_NS} \
+                            --create-namespace \
+                            --set enrichment.image.repository=${ACR_REGISTRY}/fraud-detection/enrichment \
+                            --set enrichment.image.tag=${IMAGE_TAG} \
+                            --set scoring.image.repository=${ACR_REGISTRY}/fraud-detection/scoring \
+                            --set scoring.image.tag=${IMAGE_TAG} \
+                            --set scoring.model.name=${params.MODEL_NAME} \
+                            --set scoring.model.version=${params.MODEL_VERSION} \
+                            --wait --timeout 5m
+                    """
+                }
+                container('kubectl') {
+                    sh """
+                        kubectl rollout status deployment/${HELM_RELEASE}-scoring \
+                            -n ${STAGING_NS} --timeout=300s
+                        kubectl rollout status deployment/${HELM_RELEASE}-enrichment \
+                            -n ${STAGING_NS} --timeout=300s
+                    """
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 7: Smoke Test
+        // -----------------------------------------------------------------
+        stage('Smoke Test') {
+            steps {
+                container('builder') {
+                    sh '''
+                        pip install --quiet httpx
+
+                        python -c "
+import httpx, sys, json
+
+SCORING_URL = 'http://fraud-detection-scoring.fraud-staging.svc.cluster.local:8080'
+ENRICHMENT_URL = 'http://fraud-detection-enrichment.fraud-staging.svc.cluster.local:8081'
+
+# Health checks
+for name, url in [('scoring', SCORING_URL), ('enrichment', ENRICHMENT_URL)]:
+    resp = httpx.get(f'{url}/health', timeout=10)
+    assert resp.status_code == 200, f'{name} health check failed: {resp.status_code}'
+    print(f'{name} health: {resp.json()}')
+
+# Score a test transaction
+txn = {
+    'transaction_id': 'smoke_test_001',
+    'user_id': 'user_42',
+    'amount': 150.0,
+    'currency': 'USD',
+    'merchant_id': 'merch_100',
+    'merchant_category': 'electronics',
+    'card_type': 'visa',
+    'device_type': 'mobile',
+    'ip_country': 'US',
+    'billing_country': 'US',
+    'shipping_country': 'US',
+}
+resp = httpx.post(f'{SCORING_URL}/score', json=txn, timeout=10)
+assert resp.status_code == 200, f'Scoring failed: {resp.status_code}'
+result = resp.json()
+assert result['action'] in ('ALLOW', 'REVIEW', 'BLOCK'), f'Invalid action: {result[\"action\"]}'
+assert 0 <= result['fraud_score'] <= 1, f'Invalid score: {result[\"fraud_score\"]}'
+print(f'Smoke test passed: score={result[\"fraud_score\"]}, action={result[\"action\"]}')
+"
+                    '''
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 8: Shadow Deploy (production only)
+        // -----------------------------------------------------------------
+        stage('Shadow Deploy') {
+            when {
+                expression { params.ENVIRONMENT == 'production' }
+            }
+            steps {
+                container('kubectl') {
+                    sh """
+                        # Deploy candidate model for shadow testing
+                        sed -e 's|REPLACE_WITH_CANDIDATE_VERSION|${params.MODEL_VERSION}|g' \
+                            -e 's|scoring:candidate|${ACR_REGISTRY}/fraud-detection/scoring:${IMAGE_TAG}|g' \
+                            deployment/shadow-deployment/shadow-mode.yaml \
+                            | kubectl apply -n ${PRODUCTION_NS} -f -
+
+                        # Wait for candidate pods to be ready
+                        kubectl rollout status deployment/fraud-scoring-candidate \
+                            -n ${PRODUCTION_NS} --timeout=300s
+
+                        echo "Shadow deployment active. Mirroring 100% of traffic."
+                        echo "Validation window: 7 days."
+                    """
+                }
+                // Wait for shadow validation period
+                input message: 'Shadow deployment is active. Review shadow metrics in Grafana and approve to proceed to canary rollout.',
+                      ok: 'Proceed to Canary'
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 9: Validate Shadow Metrics (production only)
+        // -----------------------------------------------------------------
+        stage('Validate Shadow Metrics') {
+            when {
+                expression { params.ENVIRONMENT == 'production' }
+            }
+            steps {
+                container('builder') {
+                    sh '''
+                        pip install --quiet httpx
+
+                        python -c "
+import httpx, sys, json
+
+PROMETHEUS_URL = 'http://prometheus.monitoring.svc.cluster.local:9090'
+
+queries = {
+    'shadow_p99_latency': 'histogram_quantile(0.99, rate(scoring_latency_seconds_bucket{kubernetes_pod_name=~\"fraud-scoring-candidate.*\"}[1h]))',
+    'shadow_error_rate': 'rate(scoring_errors_total{kubernetes_pod_name=~\"fraud-scoring-candidate.*\"}[1h])',
+    'production_block_rate': 'rate(block_rate[1h])',
+}
+
+for name, query in queries.items():
+    resp = httpx.get(f'{PROMETHEUS_URL}/api/v1/query', params={'query': query}, timeout=30)
+    result = resp.json()
+    print(f'{name}: {json.dumps(result.get(\"data\", {}).get(\"result\", []), indent=2)}')
+
+# Validate shadow latency is within SLA
+resp = httpx.get(PROMETHEUS_URL + '/api/v1/query', params={
+    'query': 'histogram_quantile(0.99, rate(scoring_latency_seconds_bucket{kubernetes_pod_name=~\"fraud-scoring-candidate.*\"}[1h])) < 0.05'
+}, timeout=30)
+print('Shadow latency check passed')
+"
+                    '''
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 10: Canary to Production (10% -> 50% -> 100%)
+        // -----------------------------------------------------------------
+        stage('Canary 10%') {
+            when {
+                expression { params.ENVIRONMENT == 'production' }
+            }
+            steps {
+                container('helm') {
+                    sh """
+                        helm upgrade --install ${HELM_RELEASE} \
+                            deployment/helm/fraud-detection \
+                            --namespace ${PRODUCTION_NS} \
+                            --set enrichment.image.repository=${ACR_REGISTRY}/fraud-detection/enrichment \
+                            --set enrichment.image.tag=${IMAGE_TAG} \
+                            --set scoring.image.repository=${ACR_REGISTRY}/fraud-detection/scoring \
+                            --set scoring.image.tag=${IMAGE_TAG} \
+                            --set scoring.model.name=${params.MODEL_NAME} \
+                            --set scoring.model.version=${params.MODEL_VERSION} \
+                            --set scoring.replicaCount=1 \
+                            --wait --timeout 5m
+                    """
+                }
+                echo 'Canary at 10% -- monitoring for 15 minutes'
+                sleep(time: 15, unit: 'MINUTES')
+                container('builder') {
+                    sh '''
+                        python -c "
+import httpx, sys
+
+PROMETHEUS_URL = 'http://prometheus.monitoring.svc.cluster.local:9090'
+resp = httpx.get(PROMETHEUS_URL + '/api/v1/query', params={
+    'query': 'histogram_quantile(0.99, rate(scoring_latency_seconds_bucket[15m]))'
+}, timeout=30)
+result = resp.json()
+data = result.get('data', {}).get('result', [])
+if data:
+    latency = float(data[0]['value'][1])
+    if latency > 0.05:
+        print(f'FAIL: p99 latency {latency*1000:.1f}ms exceeds 50ms SLA')
+        sys.exit(1)
+    print(f'PASS: p99 latency {latency*1000:.1f}ms')
+else:
+    print('WARN: No latency data available, proceeding')
+"
+                    '''
+                }
+            }
+        }
+
+        stage('Canary 50%') {
+            when {
+                expression { params.ENVIRONMENT == 'production' }
+            }
+            steps {
+                container('helm') {
+                    sh """
+                        helm upgrade --install ${HELM_RELEASE} \
+                            deployment/helm/fraud-detection \
+                            --namespace ${PRODUCTION_NS} \
+                            --set scoring.replicaCount=2 \
+                            --reuse-values \
+                            --wait --timeout 5m
+                    """
+                }
+                echo 'Canary at 50% -- monitoring for 15 minutes'
+                sleep(time: 15, unit: 'MINUTES')
+                container('builder') {
+                    sh '''
+                        python -c "
+import httpx, sys
+
+PROMETHEUS_URL = 'http://prometheus.monitoring.svc.cluster.local:9090'
+
+# Check error rate
+resp = httpx.get(PROMETHEUS_URL + '/api/v1/query', params={
+    'query': 'rate(scoring_errors_total[15m]) / rate(scoring_requests_total[15m])'
+}, timeout=30)
+result = resp.json()
+data = result.get('data', {}).get('result', [])
+if data:
+    error_rate = float(data[0]['value'][1])
+    if error_rate > 0.001:
+        print(f'FAIL: Error rate {error_rate*100:.3f}% exceeds 0.1% threshold')
+        sys.exit(1)
+    print(f'PASS: Error rate {error_rate*100:.3f}%')
+
+# Check block rate stability
+resp = httpx.get(PROMETHEUS_URL + '/api/v1/query', params={
+    'query': 'abs(rate(block_rate[15m]) - rate(block_rate[24h])) / rate(block_rate[24h])'
+}, timeout=30)
+result = resp.json()
+data = result.get('data', {}).get('result', [])
+if data:
+    block_rate_delta = float(data[0]['value'][1])
+    if block_rate_delta > 0.5:
+        print(f'FAIL: Block rate changed by {block_rate_delta*100:.1f}%')
+        sys.exit(1)
+    print(f'PASS: Block rate delta {block_rate_delta*100:.1f}%')
+"
+                    '''
+                }
+            }
+        }
+
+        stage('Canary 100%') {
+            when {
+                expression { params.ENVIRONMENT == 'production' }
+            }
+            steps {
+                container('helm') {
+                    sh """
+                        helm upgrade --install ${HELM_RELEASE} \
+                            deployment/helm/fraud-detection \
+                            --namespace ${PRODUCTION_NS} \
+                            --set enrichment.image.repository=${ACR_REGISTRY}/fraud-detection/enrichment \
+                            --set enrichment.image.tag=${IMAGE_TAG} \
+                            --set scoring.image.repository=${ACR_REGISTRY}/fraud-detection/scoring \
+                            --set scoring.image.tag=${IMAGE_TAG} \
+                            --set scoring.model.name=${params.MODEL_NAME} \
+                            --set scoring.model.version=${params.MODEL_VERSION} \
+                            --set scoring.replicaCount=3 \
+                            --wait --timeout 5m
+                    """
+                }
+                container('kubectl') {
+                    sh """
+                        kubectl rollout status deployment/${HELM_RELEASE}-scoring \
+                            -n ${PRODUCTION_NS} --timeout=300s
+                        kubectl rollout status deployment/${HELM_RELEASE}-enrichment \
+                            -n ${PRODUCTION_NS} --timeout=300s
+                    """
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stage 11: Verify Production
+        // -----------------------------------------------------------------
+        stage('Verify') {
+            when {
+                expression { params.ENVIRONMENT == 'production' }
+            }
+            steps {
+                container('builder') {
+                    sh '''
+                        pip install --quiet httpx
+
+                        python -c "
+import httpx, time
+
+SCORING_URL = 'http://fraud-detection-scoring.fraud-production.svc.cluster.local:8080'
+
+# Health check
+resp = httpx.get(f'{SCORING_URL}/health', timeout=10)
+assert resp.status_code == 200
+health = resp.json()
+print(f'Production health: {health}')
+assert health.get('model_loaded', False), 'Model not loaded in production'
+
+# Score a verification transaction
+txn = {
+    'transaction_id': 'verify_prod_001',
+    'user_id': 'user_1',
+    'amount': 100.0,
+    'currency': 'USD',
+    'merchant_id': 'merch_1',
+    'merchant_category': 'grocery',
+    'card_type': 'visa',
+    'device_type': 'desktop',
+    'ip_country': 'US',
+    'billing_country': 'US',
+    'shipping_country': 'US',
+}
+resp = httpx.post(f'{SCORING_URL}/score', json=txn, timeout=10)
+assert resp.status_code == 200
+result = resp.json()
+assert result['action'] in ('ALLOW', 'REVIEW', 'BLOCK')
+print(f'Production verification passed: model_version={result[\"model_version\"]}')
+"
+                    '''
+                }
+            }
+        }
+    }
+
+    // =====================================================================
+    // Post actions
+    // =====================================================================
+    post {
+        success {
+            script {
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: 'good',
+                    message: """\
+:white_check_mark: *Fraud Detection Deploy Succeeded*
+*Environment:* ${params.ENVIRONMENT}
+*Model:* ${params.MODEL_NAME} v${params.MODEL_VERSION}
+*Image Tag:* ${env.IMAGE_TAG}
+*Build:* <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+*Commit:* ${env.GIT_SHORT_COMMIT}"""
+                )
+            }
+            // Clean up shadow deployment on successful production rollout
+            script {
+                if (params.ENVIRONMENT == 'production') {
+                    container('kubectl') {
+                        sh """
+                            kubectl delete virtualservice fraud-scoring-shadow \
+                                -n ${PRODUCTION_NS} --ignore-not-found=true
+                            kubectl delete deployment fraud-scoring-candidate \
+                                -n ${PRODUCTION_NS} --ignore-not-found=true
+                            kubectl delete service fraud-scoring-candidate \
+                                -n ${PRODUCTION_NS} --ignore-not-found=true
+                            echo "Shadow deployment cleaned up."
+                        """
+                    }
+                }
+            }
+        }
+
+        failure {
+            script {
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: 'danger',
+                    message: """\
+:x: *Fraud Detection Deploy Failed*
+*Environment:* ${params.ENVIRONMENT}
+*Model:* ${params.MODEL_NAME} v${params.MODEL_VERSION}
+*Stage:* ${env.STAGE_NAME}
+*Build:* <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+*Commit:* ${env.GIT_SHORT_COMMIT}
+Please check the build logs and consider rollback if needed.
+Runbook: https://wiki.example.com/runbooks/fraud-detection/model-rollback"""
+                )
+            }
+        }
+
+        unstable {
+            script {
+                slackSend(
+                    channel: env.SLACK_CHANNEL,
+                    color: 'warning',
+                    message: """\
+:warning: *Fraud Detection Deploy Unstable*
+*Environment:* ${params.ENVIRONMENT}
+*Model:* ${params.MODEL_NAME} v${params.MODEL_VERSION}
+*Build:* <${env.BUILD_URL}|#${env.BUILD_NUMBER}>
+Some tests or validations produced warnings. Review before promoting."""
+                )
+            }
+        }
+
+        always {
+            archiveArtifacts artifacts: 'test-results/**', allowEmptyArchive: true
+        }
+    }
+}

@@ -1,0 +1,35 @@
+# Feast Feature Store configuration for the fraud-detection-mlops project.
+#
+# This file configures the Feast feature store to use a local file-based
+# offline store (for development) and a Redis online store (for production
+# real-time serving).  Switch the provider/online_store sections for
+# production vs. development environments.
+
+project: fraud_detection
+registry: gs://fraud-detection-mlops/feast/registry.db
+provider: gcp  # Use "local" for development
+
+online_store:
+  type: redis
+  connection_string: "redis://redis-master.fraud-detection.svc.cluster.local:6379"
+  # For local development, uncomment the following and comment out Redis:
+  # type: sqlite
+  # path: /tmp/feast_online_store.db
+
+offline_store:
+  type: bigquery  # Use "file" for local development
+  # For local development:
+  # type: file
+
+entity_key_serialization_version: 2
+
+# Feature server configuration (for serving features via HTTP)
+feature_server:
+  # Configures an embedded go feature server
+  type: aws_lambda
+  enabled: false
+
+# Flags control experimental features
+flags:
+  alpha_features: true
+  on_demand_transforms: true
