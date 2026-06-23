@@ -1,0 +1,32 @@
+# =============================================================================
+# Scoring service dependencies (slim)
+# =============================================================================
+# Only what the scoring container needs to TRAIN and SERVE the model.
+# Deliberately excludes feast / evidently / locust / dev tooling — those belong
+# to other images. Keeping this list small avoids pip's resolution-too-deep
+# error and produces a smaller, faster scoring image.
+# =============================================================================
+
+# --- Model training & optimization ---
+xgboost>=2.0,<3.0
+optuna>=3.6,<4.0
+scikit-learn>=1.4,<2.0
+imbalanced-learn>=0.12,<1.0
+
+# --- API / serving ---
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.29,<1.0
+pydantic>=2.7,<3.0
+
+# --- Experiment tracking & model registry ---
+mlflow>=2.14,<3.0
+
+# --- Data processing ---
+pandas>=2.2,<3.0
+numpy>=1.26,<2.1
+pyarrow>=15.0,<18.0
+scipy>=1.12,<2.0
+
+# --- Metrics & training plots ---
+prometheus-client>=0.20,<1.0
+matplotlib>=3.8,<4.0

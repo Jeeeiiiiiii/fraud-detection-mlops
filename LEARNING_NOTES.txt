@@ -1,0 +1,292 @@
+===============================================================================
+ FRAUD-DETECTION-MLOPS — LEARNING NOTES
+ (study session 2026-06-19, for future reference)
+===============================================================================
+
+This file is a plain-English reference for how this project works, the bugs we
+found, the fix plan, and how to run/test it locally. Written for a DevOps
+engineer learning MLOps.
+
+
+-------------------------------------------------------------------------------
+ 1. WHAT EACH FOLDER IS FOR
+-------------------------------------------------------------------------------
+
+data/        Makes SYNTHETIC transaction data for training.
+             - generate_transactions.py = ~200k legit transactions (is_fraud=0)
+             - fraud_patterns.py        = injects ~2% fraud (is_fraud=1) in 5
+               shapes: velocity attack, geo mismatch, amount anomaly, account
+               takeover, card testing.
+             NOTE: synthetic because real fraud data is private/regulated. In a
+             real company this does NOT exist — real transactions come from the
+             live payment system (Data Engineers own that).
+
+features/    Turns raw transactions into "signals" (features) the model uses.
+             - feast/definitions.py = the CONTRACT/schema. Declares what
+               features exist (avg_amount_30d, transaction_count_24h, etc.),
+               their type, where they live (BigQuery), and freshness (ttl).
+               It does NOT compute or transform anything — it's a blueprint,
+               like a CREATE TABLE statement or a K8s manifest.
+             - enrichment_service/app.py = the live worker. A FastAPI service
+               that, per transaction, READS history from Redis + computes live
+               velocity + derives comparisons, then hands the enriched record
+               to the scoring model.
+
+training/    Learns the model from data + features.
+             - train.py = load data -> feature engineering -> SMOTE (fix 2%
+               imbalance) -> Optuna hyperparameter search -> train XGBoost ->
+               log to MLflow -> register model. Optimizes recall while keeping
+               precision >= 0.5.
+             - pipeline/training_pipeline.yaml = Argo workflow that orchestrates
+               train -> evaluate -> champion/challenger gate -> register ->
+               deploy-staging.
+
+serving/     The live scoring service.
+             - predict.py = FastAPI service. Loads model from MLflow at startup,
+               scores transactions, returns ALLOW / REVIEW / BLOCK.
+             - load_test/locustfile.py = simulates traffic (1000 req/s, p99<50ms)
+
+deployment/  How it ships: Helm charts, HPA autoscaling, Istio shadow deploy,
+             Jenkinsfile (CI/CD).
+
+monitoring/  Grafana dashboards + Prometheus alerts (fraud rate, false positive
+             rate, latency, drift).
+
+
+-------------------------------------------------------------------------------
+ 2. WHO OWNS WHAT IN REAL INDUSTRY (vs this portfolio project)
+-------------------------------------------------------------------------------
+
+data/      -> Data Engineers (real pipelines). Synthetic gen is portfolio-only.
+features/  -> SHARED. Data Scientists decide WHICH features are predictive;
+              MLOps owns the feature-store INFRA (Feast, Redis, enrichment
+              service, latency, deployment). This is heavily MLOps turf.
+training/  -> Data Scientists pick the model/math; MLOps makes it repeatable
+              (pipeline, MLflow, CI). You don't pick XGBoost; you make it run.
+serving/   -> Mostly MLOps (it's a microservice with a latency SLA).
+deployment -> MLOps/DevOps (Docker, Helm, K8s, Istio, Jenkins). HOME TURF.
+monitoring -> MLOps/DevOps (Prometheus, Grafana). HOME TURF.
+
+Mental model: Data Scientists decide WHAT the model is. Data Engineers supply
+the FUEL. MLOps builds the FACTORY + CONVEYOR BELTS + SAFETY SYSTEMS that turn
+experiments into something running 24/7.
+
+
+-------------------------------------------------------------------------------
+ 3. THE FEATURE FLOW (how features get to the model) — IMPORTANT
+-------------------------------------------------------------------------------
+
+STAGE 0 (offline, scheduled job — NOT in the live request path):
+  Job A: a SQL query (or Spark job) runs over the BigQuery warehouse and
+         COMPUTES aggregates like avg_amount_30d. Writes them to a BigQuery
+         table. (Feast/definitions.py NOT involved here.)
+  Job B: `feast materialize` reads that table and LOADS the values into Redis
+         (fast cache). definitions.py IS used here — it's the instruction sheet
+         telling materialize the shape + source.
+  -> This Stage 0 job is a "data pipeline". When it breaks (e.g. fails at 2am),
+     the model keeps running but silently uses STALE/DEFAULT features and makes
+     bad decisions. Keeping this pipeline healthy = an MLOps job. Tools: alerts
+     on job failure, freshness checks (the ttl=24h in definitions.py), data
+     validation, graceful fallback. NOTE: this Stage 0 job does NOT yet exist
+     in this repo — it's assumed/stubbed.
+
+PER TRANSACTION (live, milliseconds):
+  - A transaction = a real customer purchase. Comes IN from outside (payment
+    gateway / Kafka / Event Hub). NOT produced by Redis. NOT in this repo
+    (assumed external).
+  - Enrichment service receives it, takes the user_id, and READS that user's
+    history OUT of Redis (a lookup, NOT a write). Redis answers with
+    avg_amount_30d etc.
+  - Enrichment computes live velocity + derives comparisons
+    (amount_vs_avg_ratio = this amount / avg_amount_30d).
+  - It builds a NEW wider "enriched" record (~11 fields in -> ~25 out). It does
+    NOT overwrite anything in a DB — it's a streaming/request pipeline (like
+    middleware enriching an HTTP request).
+  - Enriched record -> scoring model -> ALLOW / REVIEW / BLOCK.
+
+Key separation: Stage 0 = slow, batch, ahead of time. Live = fast, per-request.
+Precompute the expensive stuff offline so the live path stays under 50ms. That
+split is THE core trick of real-time ML serving.
+
+Databases: real companies have BOTH an operational SQL DB (records each payment
+live, "now") AND a warehouse like BigQuery (history, for analytics/ML). Redis is
+a fast in-memory cache holding precomputed features for millisecond lookup.
+
+
+-------------------------------------------------------------------------------
+ 4. MLOPS TOOLS — WHERE THEY LIVE / WHICH PHASE
+-------------------------------------------------------------------------------
+
+By lifecycle phase (maps almost 1:1 onto the folders):
+  TRAIN phase   -> Optuna, MLflow, Argo            (training/)
+  FEATURE phase -> Feast, Redis                    (features/)
+  SERVE phase   -> MLflow (load), KServe, FastAPI  (serving/)
+  SHIP phase    -> Docker, Helm, Istio, Jenkins    (deployment/)
+  WATCH phase   -> Prometheus, Grafana, Evidently  (monitoring/)
+
+MLflow is special: it spans TWO folders because it's the HANDOFF point —
+training WRITES the model into it; serving READS the model out of it.
+
+MLflow UI (localhost:5000) is for VIEWING results/models only. It has NO
+"Train" button. The "trigger training" role in real MLOps = Jenkins (Build
+button) or Argo Workflows (Submit button). Those need a server/cluster and are
+NOT running in the local docker-compose stack, so for now training is run via
+CLI (which is exactly what a UI button would run behind the scenes anyway).
+
+
+-------------------------------------------------------------------------------
+ 5. BUGS FOUND + FIX ROADMAP
+-------------------------------------------------------------------------------
+
+TIER 1 — correctness bugs (highest value, do first):
+
+  BUG #1 — Training-serving skew (encoding).  [IN PROGRESS]
+    train.py:120 encodes categoricals (visa, mastercard...) with a LabelEncoder
+    and SAVES the encoders to MLflow (train.py:481). But serving predict.py:243
+    uses hash(value) % 10000 — a DIFFERENT encoding. So "visa" = 2 in training
+    but 7412 in serving. The model gets garbage for all 6 categorical features
+    in production. This is THE classic MLOps failure (training-serving skew).
+    FIX: load + apply the saved LabelEncoder artifacts at serving startup.
+
+  BUG #2 — Model ignores enriched features.
+    The model is trained on only 13 features (train.py:74-83) = raw fields +
+    simple flags. NONE of velocity_*, avg_amount_30d, amount_vs_avg_ratio,
+    merchant_fraud_rate_30d are in the model's feature set. So the entire
+    Feast + enrichment apparatus is DECORATIVE — the model never sees it.
+    FIX: add enriched features to the training feature set and wire through
+    serving.
+
+TIER 2 — lifecycle completeness:
+  #3 Stage 0 `feast materialize` job doesn't exist (BigQuerySource declared but
+     nothing fills it / loads Redis).
+  #4 enrichment -> scoring orchestration not wired (predict.py:531 /predict
+     bypasses enrichment entirely; nothing chains the two services).
+  #5 Ground-truth / feedback loop missing (can't compute the false-positive
+     rate the README brags about; predictions logged at predict.py:398 but
+     never joined to real outcomes/chargebacks).
+  #6 Drift detection: Evidently named + dashboard json exists, but no job
+     actually computes drift metrics.
+
+TIER 3 — polish:
+  - predict.py:183 loads the model's optimal_threshold but never uses it
+    (decisions use env-var thresholds at predict.py:365). Inconsistent.
+  - Hardcoded Slack webhook placeholder in training_pipeline.yaml:58.
+  - Deprecated MLflow APIs (get_latest_versions, stage transitions).
+
+
+-------------------------------------------------------------------------------
+ 6. BUILD FIX WE ALREADY MADE (2026-06-19)
+-------------------------------------------------------------------------------
+
+PROBLEM: `docker compose up --build` failed after ~52 min with
+  "error: resolution-too-deep / Dependency resolution exceeded maximum depth".
+CAUSE: the single root requirements.txt was installed into EVERY image. The
+  killer was feast[redis,gcp] (line 18) — it pulls a huge transitive graph
+  (transformers, dask, 5x google-cloud-*, litestar...) that, combined with
+  mlflow/evidently/locust, made pip's resolver give up.
+FIX (applied):
+  - Created serving/requirements.txt = slim list (only training + serving deps;
+    NO feast/evidently/locust/dev tools). ~15 packages instead of ~40.
+  - Changed serving/Dockerfile line 24: COPY serving/requirements.txt .
+  - Built + ran ONLY scoring + mlflow:  docker compose up -d --build mlflow
+    scoring-service   (skipping the enrichment service for now).
+  Result: built in a few minutes, both services healthy.
+STILL TODO: the enrichment service has the same feast problem; give it the same
+  slim treatment but with feast PINNED to one version to tame its graph. Only
+  needed when we work on parts that require enrichment.
+
+
+-------------------------------------------------------------------------------
+ 7. HOW TO RUN & TEST LOCALLY (docker-compose path)
+-------------------------------------------------------------------------------
+
+docker compose = runs multiple containers together on one machine (like a
+"Kubernetes-lite for your laptop"; declares services in YAML, shared network,
+find each other by name). This repo also has Helm charts for the real K8s
+deploy. `docker compose up --build` = BUILD the images THEN START them (unlike
+`docker build` which only builds). Add -d to run detached (background).
+
+STARTUP (scoring + mlflow only, while enrichment's feast issue is unfixed):
+  docker compose up -d --build mlflow scoring-service
+  docker compose ps                      # check both are "healthy"
+  curl.exe http://localhost:8080/health  # model_loaded:false = stub (expected)
+
+THE STUB: if no trained model exists, scoring returns RANDOM low scores
+(predict.py:223) — it ignores the transaction entirely. So you MUST train once
+before testing anything meaningful.
+
+GET A REAL MODEL:
+  # 1. generate fake training data (50k txns, fixed seed for reproducibility)
+  docker compose exec scoring-service python /app/data/generate_transactions.py \
+      --output-dir /app/data/output --n-transactions 50000 --seed 42
+
+  # 2. train (run train() inside the container; 5 Optuna trials = fast;
+  #    logs+registers the model in MLflow)
+  docker compose exec scoring-service python -c "import sys; sys.path.insert(0,'/app'); from training.train import train; train(data_path='/app/data/output/transactions.parquet', mlflow_uri='http://mlflow:5000', n_trials=5)"
+
+  # 3. restart scoring so it LOADS the new model (it only loads at startup),
+  #    then verify
+  docker compose restart scoring-service
+  curl.exe http://localhost:8080/health   # should now say model_loaded:true
+
+A model persists in MLflow (docker volume), so you only retrain when code/
+features/data change — NOT every restart.
+
+Command meanings:
+  docker compose exec <service> <cmd>  = run a command inside a running
+                                          container (like kubectl exec)
+  python -c "..."                       = run Python code given as a string
+  --seed 42                             = same fake data every time (reproducible)
+  n_trials=5                            = quick hyperparameter search (prod=50)
+
+USEFUL URLS (when running):
+  http://localhost:8080  scoring service (/health, /score, /predict, /metrics)
+  http://localhost:8081  enrichment service (when running)
+  http://localhost:5000  MLflow UI (view experiments + registered models)
+  http://localhost:9090  Prometheus
+  http://localhost:3000  Grafana (admin/admin)
+
+
+-------------------------------------------------------------------------------
+ 8. HOW WE TEST A FIX — TWO LAYERS + BEFORE/AFTER
+-------------------------------------------------------------------------------
+
+Both Tier-1 bugs are SILENT (service returns 200 OK whether right or wrong), so
+"testing" means making the bug VISIBLE with a before/after comparison.
+
+LAYER A — unit test (precise / "is the wiring right?"):
+  e.g. assert serving encodes "visa" to the SAME number training did.
+  Before fix: fails (7412 != 2).  After fix: passes (2 == 2).
+
+LAYER B — behavioral / end-to-end test ("does it actually catch fraud?"):
+  send an obvious fraud (NG country, $9000, geo mismatch) to /score/batch and
+  check it comes back BLOCK/REVIEW with a high score.
+  Before fix: scrambled encodings -> fraud looks like legit (poor separation).
+  After fix: fraud scores clearly higher.
+
+Want both: A = mechanically correct; B = it actually matters to the outcome.
+
+THE LOOP FOR EVERY FIX:
+  1. capture "before" (run test, note the number / failing assertion)
+  2. apply the fix
+  3. capture "after" (same test, confirm improved / passes)
+  4. leave a regression test (pytest tests/ -v) so it can't silently re-break
+
+curl for manual API poke (Windows/Git Bash: use curl.exe):
+  curl.exe -X POST http://localhost:8080/score/batch \
+    -H "Content-Type: application/json" -d '[ ...txns... ]'
+  -X POST = send data; -H = header (body is JSON); -d = the data/body.
+  (On Windows, long inline JSON is fiddly — use -d "@payload.json" from a file.)
+
+
+-------------------------------------------------------------------------------
+ 9. NEXT STEP (where we left off)
+-------------------------------------------------------------------------------
+
+Stack is up (scoring + mlflow healthy). Next: run the generate-data + train +
+restart sequence so model_loaded flips to true. THEN start BUG #1:
+  1. write a failing Layer-A test (watch the encoding bug go RED)
+  2. fix predict.py to load + use the saved LabelEncoder from MLflow
+  3. re-run test (GREEN) + before/after behavioral check
+After #1, do #2 (wire enriched features into the model), then Stage 0 (#3).
+===============================================================================
